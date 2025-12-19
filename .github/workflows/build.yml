@@ -1,9 +1,8 @@
 name: Build and Release
 
 on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+  release:
+    types: [created]
 
 jobs:
   build:
@@ -27,14 +26,9 @@ jobs:
       run: |
         CGO_ENABLED=1 GOOS=linux GOARCH=amd64 go build -v -ldflags="-s -w" -o smtp-verifier .
     
-    - name: Update Latest Release
+    - name: Upload Release Asset
       uses: softprops/action-gh-release@v1
       with:
-        tag_name: latest
-        name: Latest Build
-        body: "Automated build from main branch."
         files: smtp-verifier
-        draft: false
-        prerelease: false
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
