@@ -30,7 +30,7 @@ const (
 	maxWorkers         = 4
 	globalRateLimit    = 42 // max SMTP servers per minute
 	capabilityCacheTTL = 30 * time.Minute
-	serverAddr         = ":8080"
+	serverAddr         = ":1240"
 	dbFile             = "scans.db"
 )
 
