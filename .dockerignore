@@ -1,0 +1,17 @@
+# Local database files
+*.db
+*.db-shm
+*.db-wal
+
+# Binaries
+smtp-verifier
+verify
+
+# Artifacts and logs
+.gemini/
+.git/
+node_modules/
+dist/
+
+# Env files
+.env

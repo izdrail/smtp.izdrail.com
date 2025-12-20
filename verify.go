@@ -28,7 +28,7 @@ import (
 /* ============================================================
    CONFIG
 ============================================================ */
-const (
+var (
 	maxWorkers         = 4
 	globalRateLimit    = 42 // max SMTP servers per minute
 	capabilityCacheTTL = 30 * time.Minute
@@ -36,6 +36,19 @@ const (
 	dbFile             = "scans.db"
 	defaultTimeout     = 30 * time.Second // Sync request timeout
 )
+
+func initConfig() {
+	if port := os.Getenv("PORT"); port != "" {
+		if !strings.HasPrefix(port, ":") {
+			serverAddr = ":" + port
+		} else {
+			serverAddr = port
+		}
+	}
+	if db := os.Getenv("DB_PATH"); db != "" {
+		dbFile = db
+	}
+}
 
 /* ============================================================
    PROVIDERS
@@ -1020,6 +1033,7 @@ func docsHandler(w http.ResponseWriter, r *http.Request) {
 func main() {
 	// Setup standard logger to print microseconds for better debugging
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	initConfig()
 
 	if err := initDB(); err != nil {
 		log.Fatalf("Failed to init DB: %v", err)

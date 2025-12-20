@@ -1,0 +1,12 @@
+services:
+  verifier:
+    container_name: smtp-verifier
+    build: .
+    ports:
+      - "1240:1240"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=1240
+      - DB_PATH=/app/data/scans.db
+    restart: unless-stopped
