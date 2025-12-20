@@ -8,11 +8,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"net"
 	"net/http"
 	"net/smtp"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -32,6 +34,7 @@ const (
 	capabilityCacheTTL = 30 * time.Minute
 	serverAddr         = ":1240"
 	dbFile             = "scans.db"
+	defaultTimeout     = 30 * time.Second // Sync request timeout
 )
 
 /* ============================================================
@@ -112,6 +115,8 @@ var (
 	capCache = map[string]capEntry{}
 )
 
+var ErrRateLimit = errors.New("rate limit exceeded")
+
 /* ============================================================
    GLOBAL SMTP RATE LIMIT
 ============================================================ */
@@ -129,6 +134,7 @@ func initRateLimiter() {
 			globalRateMu.Lock()
 			tokens = globalRateLimit
 			globalRateMu.Unlock()
+			log.Printf("[RateLimiter] Tokens refilled to %d", globalRateLimit)
 		}
 	}()
 }
@@ -140,6 +146,7 @@ func acquireToken() bool {
 		tokens--
 		return true
 	}
+	log.Printf("[RateLimiter] Rate limit exceeded! Tokens exhausted.")
 	return false
 }
 
@@ -150,29 +157,43 @@ type VerifyJob struct {
 	ID       string
 	Email    string
 	Password string
+	Ctx      context.Context    // For cancellation
+	Cancel   context.CancelFunc // Cancel function
 }
 
 type JobResult struct {
 	Status       string            `json:"status"`
 	Error        string            `json:"error,omitempty"`
 	Capabilities *SMTPCapabilities `json:"capabilities,omitempty"`
-	Headers      []string          `json:"headers,omitempty"`
-	CreatedAt    time.Time         `json:"created_at,omitempty"`
-	CompletedAt  time.Time         `json:"completed_at,omitempty"`
+	Headers      []string          `json:"headers,omitempty"` // Legacy: Now subset of Logs or just empty
+	Logs         []string          `json:"logs,omitempty"`
+	CreatedAt    time.Time         `json:"created_at"`
+	CompletedAt  time.Time         `json:"completed_at"`
+}
+
+type WorkerState struct {
+	ID         int       `json:"id"`
+	Status     string    `json:"status"` // "idle" or "processing"
+	CurrentJob string    `json:"current_job,omitempty"` // Email
+	JobID      string    `json:"job_id,omitempty"`      // Job ID for cancellation
+	StartedAt  time.Time `json:"started_at,omitempty"`
 }
 
 type JobManager struct {
-	mu      sync.RWMutex
-	results map[string]JobResult
-	queue   chan VerifyJob
+	mu        sync.RWMutex
+	queue     chan VerifyJob
+	waitChans sync.Map // map[string]chan JobResult
 }
 
-var jobManager = &JobManager{
-	results: make(map[string]JobResult),
-	queue:   make(chan VerifyJob, 100),
-}
-
-var db *sql.DB
+var (
+	jobManager        = &JobManager{
+		queue: make(chan VerifyJob, 1000), // Larger buffer for bulk
+	}
+	db                *sql.DB
+	activeLoggers     sync.Map // map[string]*SMTPLogger
+	workerStates      sync.Map // map[int]WorkerState
+	activeCancelFuncs sync.Map // map[string]context.CancelFunc (JobID -> CancelFunc)
+)
 
 /* ============================================================
    SMTP LOGGER
@@ -185,7 +206,9 @@ type SMTPLogger struct {
 func (l *SMTPLogger) Log(format string, args ...interface{}) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	l.records = append(l.records, fmt.Sprintf(format, args...))
+	msg := fmt.Sprintf(format, args...)
+	l.records = append(l.records, msg)
+	log.Printf("[SMTP] %s", msg) // Also log to stdout
 }
 
 func (l *SMTPLogger) Dump() []string {
@@ -194,40 +217,94 @@ func (l *SMTPLogger) Dump() []string {
 	return append([]string(nil), l.records...)
 }
 
+
+
 /* ============================================================
    SMTP LOGIC
 ============================================================ */
 func discoverSMTP(domain string) ([]string, error) {
-	mx, err := net.LookupMX(domain)
-	if err != nil || len(mx) == 0 {
-		return nil, errors.New("no MX records found")
-	}
+	log.Printf("[Discovery] Looking up MX records for domain: %s", domain)
 	var hosts []string
-	for _, m := range mx {
-		hosts = append(hosts, strings.TrimSuffix(m.Host, "."))
+	
+	// 1. MX Records
+	mx, err := net.LookupMX(domain)
+	if err != nil {
+		log.Printf("[Discovery] MX lookup failed for %s: %v", domain, err)
+	} else {
+		for _, m := range mx {
+			hosts = append(hosts, strings.TrimSuffix(m.Host, "."))
+		}
 	}
+
+	// 2. Fallbacks
+	// Always add common subdomains because sometimes MX records point to non-responsive gateways or filter heavily
+	hosts = append(hosts, "smtp."+domain)
+	hosts = append(hosts, "mail."+domain)
+	// hosts = append(hosts, domain) // Sometimes the domain itself is the mail server
+
+	if len(hosts) == 0 {
+		return nil, errors.New("no SMTP hosts found")
+	}
+	
+	log.Printf("[Discovery] Candidates for %s: %v", domain, hosts)
 	return hosts, nil
 }
 
-func connectSMTP(host string, logger *SMTPLogger) (*smtp.Client, error) {
-	logger.Log("Connecting to %s:587", host)
-	conn, err := net.DialTimeout("tcp", host+":587", 5*time.Second)
-	if err != nil {
-		logger.Log("Connection failed: %v", err)
-		return nil, err
-	}
-	c, err := smtp.NewClient(conn, host)
-	if err != nil {
-		logger.Log("SMTP handshake failed: %v", err)
-		return nil, err
-	}
-	if ok, _ := c.Extension("STARTTLS"); ok {
-		logger.Log("Starting TLS")
-		if err := c.StartTLS(&tls.Config{ServerName: host}); err != nil {
-			c.Close()
-			logger.Log("STARTTLS failed: %v", err)
+func connectSMTP(ctx context.Context, host, port string, implicitTLS bool, logger *SMTPLogger) (*smtp.Client, error) {
+	addr := net.JoinHostPort(host, port)
+	logger.Log("Connecting to %s (ImplicitTLS=%v)", addr, implicitTLS)
+
+	var c *smtp.Client
+	var err error
+	
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+
+	if implicitTLS {
+		// Port 465: TLS connection from start
+		conn, err := dialer.DialContext(ctx, "tcp", addr)
+		if err != nil {
+			logger.Log("TCP Connection to %s failed: %v", addr, err)
 			return nil, err
 		}
+		
+		tlsConfig := &tls.Config{ServerName: host, InsecureSkipVerify: true}
+		tlsConn := tls.Client(conn, tlsConfig)
+		// Handshake with Context support (Go 1.14+)
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			logger.Log("TLS Handshake to %s failed: %v", addr, err)
+			return nil, err
+		}
+		
+		c, err = smtp.NewClient(tlsConn, host)
+		if err != nil {
+			logger.Log("SMTP handshake (TLS) with %s failed: %v", addr, err)
+			return nil, err
+		}
+		return c, nil
+	}
+	
+	// Port 25, 587, 2525: STARTTLS or Plain
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		logger.Log("Connection to %s failed: %v", addr, err)
+		return nil, err
+	}
+	c, err = smtp.NewClient(conn, host)
+	if err != nil {
+		logger.Log("SMTP handshake with %s failed: %v", addr, err)
+		return nil, err
+	}
+	// Negotiate STARTTLS if available
+	if ok, _ := c.Extension("STARTTLS"); ok {
+		logger.Log("STARTTLS supported on %s, negotiating...", host)
+		if err := c.StartTLS(&tls.Config{ServerName: host, InsecureSkipVerify: true}); err != nil {
+			c.Close()
+			logger.Log("STARTTLS negotiation failed: %v", err)
+			return nil, err
+		}
+		logger.Log("STARTTLS successful")
+	} else {
+		logger.Log("STARTTLS NOT supported on %s", host)
 	}
 	return c, nil
 }
@@ -237,8 +314,10 @@ func probeCapabilities(c *smtp.Client, host string) SMTPCapabilities {
 	entry, ok := capCache[host]
 	capMu.RUnlock()
 	if ok && time.Now().Before(entry.exp) {
+		log.Printf("[Cache] Hit capability cache for %s", host)
 		return entry.caps
 	}
+	log.Printf("[Cache] Miss capability cache for %s, probing...", host)
 	caps := SMTPCapabilities{Host: host}
 
 	if ok, ext := c.Extension("AUTH"); ok {
@@ -257,6 +336,7 @@ func probeCapabilities(c *smtp.Client, host string) SMTPCapabilities {
 
 func tryAuth(c *smtp.Client, caps SMTPCapabilities, email, password string) error {
 	for _, m := range caps.AuthMethods {
+		log.Printf("[Auth] Trying auth method %s for %s", m, email)
 		switch strings.ToUpper(m) {
 		case "LOGIN":
 			return c.Auth(&loginAuth{email, password})
@@ -264,39 +344,96 @@ func tryAuth(c *smtp.Client, caps SMTPCapabilities, email, password string) erro
 			return c.Auth(&plainAuth{email, password})
 		}
 	}
+	log.Printf("[Auth] No supported auth methods found in %v", caps.AuthMethods)
 	return errors.New("no supported auth methods")
 }
 
-func verifySMTP(email, password string) (*SMTPCapabilities, []string, error) {
-	reqLogger := &SMTPLogger{}
-	if !acquireToken() {
-		reqLogger.Log("Rate limit exceeded")
-		return nil, reqLogger.Dump(), errors.New("global SMTP rate limit exceeded (max 42 per minute)")
+func verifySMTP(ctx context.Context, jobID, email, password string) (*SMTPCapabilities, []string, error) {
+	// Create or Reuse Logger
+	logger := &SMTPLogger{}
+	if jobID != "" {
+		activeLoggers.Store(jobID, logger)
+		defer activeLoggers.Delete(jobID)
 	}
+
+	if !acquireToken() {
+		logger.Log("Global rate limit exceeded (42/min)")
+		return nil, logger.Dump(), ErrRateLimit
+	}
+	
+	// Check Context
+	select {
+	case <-ctx.Done():
+		logger.Log("Verification cancelled by user.")
+		return nil, logger.Dump(), ctx.Err()
+	default:
+	}
+
+	log.Printf("[Verify] Starting verification for %s", email)
+	logger.Log("Starting verification for %s", email)
+	
 	parts := strings.Split(email, "@")
 	if len(parts) != 2 {
-		return nil, reqLogger.Dump(), errors.New("invalid email")
+		return nil, logger.Dump(), errors.New("invalid email format")
 	}
 	if isOAuthOnly(detectProvider(parts[1])) {
-		return nil, reqLogger.Dump(), errors.New("provider requires OAuth")
+		logger.Log("Provider %s requires OAuth, skipping password auth", parts[1])
+		return nil, logger.Dump(), errors.New("provider requires OAuth")
 	}
+
 	hosts, err := discoverSMTP(parts[1])
 	if err != nil {
-		return nil, reqLogger.Dump(), err
+		logger.Log("Discovery failed: %v", err)
+		return nil, logger.Dump(), err
 	}
+
+	// Define ports to try
+	ports := []struct{
+		Port        string
+		ImplicitTLS bool
+	}{
+		{"465", true},   // Legacy SMTPS (often most reliable for auth)
+		{"587", false},  // Submission (STARTTLS)
+		{"25", false},   // Relay (STARTTLS)
+		{"2525", false}, // Alternative
+	}
+
+	var lastErr error
 	for _, host := range hosts {
-		c, err := connectSMTP(host, reqLogger)
-		if err != nil {
-			continue
-		}
-		caps := probeCapabilities(c, host)
-		err = tryAuth(c, caps, email, password)
-		c.Quit()
-		if err == nil {
-			return &caps, reqLogger.Dump(), nil
+		for _, p := range ports {
+			// Check Context
+			select {
+			case <-ctx.Done():
+				logger.Log("Verification cancelled.")
+				return nil, logger.Dump(), ctx.Err()
+			default:
+			}
+			
+			logger.Log("Trying host: %s Port: %s", host, p.Port)
+			c, err := connectSMTP(ctx, host, p.Port, p.ImplicitTLS, logger)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			
+			caps := probeCapabilities(c, host)
+			logger.Log("Capabilities: Auth=%v TLS=%v", caps.AuthMethods, caps.StartTLS)
+			
+			if err := tryAuth(c, caps, email, password); err != nil {
+				logger.Log("Auth failed: %v", err)
+				c.Close()
+				lastErr = err
+				continue 
+			}
+
+			logger.Log("Authentication successful on %s:%s!", host, p.Port)
+			c.Quit()
+			return &caps, logger.Dump(), nil
 		}
 	}
-	return nil, reqLogger.Dump(), errors.New("authentication failed")
+	
+	logger.Log("Verification failed on all hosts/ports. Last error: %v", lastErr)
+	return nil, logger.Dump(), lastErr
 }
 
 /* ============================================================
@@ -304,13 +441,12 @@ func verifySMTP(email, password string) (*SMTPCapabilities, []string, error) {
 ============================================================ */
 func initDB() error {
 	var err error
-	// Enable time parsing and WAL mode for better concurrency and reliability
 	dsn := fmt.Sprintf("%s?_parseTime=true&_journal_mode=WAL", dbFile)
+	log.Printf("[DB] Opening database at %s", dbFile)
 	db, err = sql.Open("sqlite3", dsn)
 	if err != nil {
 		return err
 	}
-	// Initial connection verification
 	if err := db.Ping(); err != nil {
 		return err
 	}
@@ -321,84 +457,159 @@ func initDB() error {
 		email TEXT,
 		domain TEXT,
 		status TEXT,
+		password TEXT,
 		error TEXT,
 		auth_method TEXT,
 		headers TEXT,
+		logs TEXT,
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		completed_at DATETIME
 	)`)
 	
-	// Auto-migration for existing databases
 	if err == nil {
-		fmt.Println("Running DB migrations...")
-		// SQLite might fail adding column with default CURRENT_TIMESTAMP via ALTER TABLE
-		// So we add it without default, then backfill
-		if _, errMig := db.Exec(`ALTER TABLE scans ADD COLUMN created_at DATETIME`); errMig != nil {
-			fmt.Printf("Migration created_at: %v\n", errMig)
-		} else {
-			fmt.Println("Migration created_at: success")
-			// Backfill existing rows
-			db.Exec(`UPDATE scans SET created_at = completed_at WHERE created_at IS NULL`)
-		}
-		
-		if _, errMig := db.Exec(`ALTER TABLE scans ADD COLUMN completed_at DATETIME`); errMig != nil {
-			// Ignore duplicate column error usually
-			if !strings.Contains(errMig.Error(), "duplicate") {
-				fmt.Printf("Migration completed_at: %v\n", errMig)
-			}
-		}
-
-		if _, errMig := db.Exec(`ALTER TABLE scans ADD COLUMN error TEXT`); errMig != nil {
-			if !strings.Contains(errMig.Error(), "duplicate") {
-				fmt.Printf("Migration error column: %v\n", errMig)
-			}
-		}
-	} else {
-		fmt.Printf("InitDB Create Table Error: %v\n", err)
+		log.Println("[DB] Running Ensure-Schema migrations...")
+		db.Exec(`ALTER TABLE scans ADD COLUMN created_at DATETIME`)
+		db.Exec(`UPDATE scans SET created_at = completed_at WHERE created_at IS NULL`)
+		db.Exec(`ALTER TABLE scans ADD COLUMN completed_at DATETIME`)
+		db.Exec(`ALTER TABLE scans ADD COLUMN error TEXT`)
+		// New columns
+		db.Exec(`ALTER TABLE scans ADD COLUMN password TEXT`)
+		db.Exec(`ALTER TABLE scans ADD COLUMN logs TEXT`)
 	}
-	
 	return err
 }
 
-func saveScan(id, email, status, errorMsg string, headers []string) {
+func createPendingScan(id, email, password string) error {
 	domain := ""
 	parts := strings.Split(email, "@")
 	if len(parts) == 2 {
 		domain = parts[1]
 	}
-	hdrJSON, _ := json.Marshal(headers)
-	db.Exec(`INSERT INTO scans(id,email,domain,status,error,auth_method,headers,created_at,completed_at) VALUES(?,?,?,?,?,?,?,?,?)`,
-		id, email, domain, status, errorMsg, "", string(hdrJSON), time.Now(), time.Now())
+	log.Printf("[DB] Inserting PENDING scan: %s (%s)", id, email)
+	// We save password here for retry logic
+	_, err := db.Exec(`INSERT INTO scans(id, email, domain, status, password, created_at) VALUES(?, ?, ?, ?, ?, ?)`,
+		id, email, domain, "pending", password, time.Now())
+	return err
+}
+
+func updateScanResult(id string, res JobResult) error {
+	hdrJSON, _ := json.Marshal(res.Headers) // Legacy Headers (which were logs)
+	logsJSON, _ := json.Marshal(res.Logs)
+	
+	log.Printf("[DB] Updating scan result for %s: %s (Err: %v)", id, res.Status, res.Error)
+	
+	// auth_method logic: get from caps if avail, or empty
+	authMethod := ""
+	if res.Capabilities != nil && len(res.Capabilities.AuthMethods) > 0 {
+		authMethod = strings.Join(res.Capabilities.AuthMethods, ",")
+	}
+	
+	_, err := db.Exec(`UPDATE scans SET status=?, error=?, headers=?, logs=?, auth_method=?, completed_at=? WHERE id=?`,
+		res.Status, res.Error, string(hdrJSON), string(logsJSON), authMethod, res.CompletedAt, id)
+	return err
 }
 
 /* ============================================================
    WORKER POOL
 ============================================================ */
 func startWorkers(n int) {
+	log.Printf("[Worker] Starting %d workers", n)
 	for i := 0; i < n; i++ {
-		go worker()
+		go worker(i)
 	}
 }
 
-func worker() {
+func worker(id int) {
+	log.Printf("[Worker %d] Started", id)
+	workerStates.Store(id, WorkerState{ID: id, Status: "idle", StartedAt: time.Now()})
+
 	for job := range jobManager.queue {
-		caps, headers, err := verifySMTP(job.Email, job.Password)
+		log.Printf("[Worker %d] Processing job %s (%s)", id, job.ID, job.Email)
+		
+		// Update Worker State
+		workerStates.Store(id, WorkerState{
+			ID:         id,
+			Status:     "processing",
+			CurrentJob: job.Email,
+			JobID:      job.ID,
+			StartedAt:  time.Now(),
+		})
+
+		// Setup Context (if not already set, though it should be)
+		if job.Ctx == nil {
+			job.Ctx, job.Cancel = context.WithCancel(context.Background())
+		}
+		activeCancelFuncs.Store(job.ID, job.Cancel)
+
+		var caps *SMTPCapabilities
+		var logs []string
+		var err error
+
+		// Retry Loop for Rate Limiting
+		for {
+			// Check Context
+			select {
+			case <-job.Ctx.Done():
+				err = job.Ctx.Err()
+				break
+			default:
+			}
+
+			caps, logs, err = verifySMTP(job.Ctx, job.ID, job.Email, job.Password)
+			if err == ErrRateLimit {
+				log.Printf("[Worker %d] Rate limit hit for %s, sleeping 5s...", id, job.ID)
+				
+				// Sleep with context awareness
+				select {
+				case <-time.After(5 * time.Second):
+					continue
+				case <-job.Ctx.Done():
+					err = job.Ctx.Err()
+					break
+				}
+			}
+			break
+		}
+
 		res := JobResult{
 			Status:       "success",
 			Capabilities: caps,
-			Headers:      headers,
-			CreatedAt:    time.Now().Add(-time.Second), // Approximate
+			Headers:      logs, // Keep for legacy/summary
+			Logs:         logs, // Full logs
+			CreatedAt:    time.Now(),
 			CompletedAt:  time.Now(),
 		}
 		if err != nil {
-			res.Status = "failed"
-			res.Error = err.Error()
+			if errors.Is(err, context.Canceled) {
+				res.Status = "cancelled"
+				res.Error = "cancelled by user"
+			} else {
+				res.Status = "failed"
+				res.Error = err.Error()
+			}
 		}
-		saveScan(job.ID, job.Email, res.Status, res.Error, headers)
+
+		// Update Database
+		if dbErr := updateScanResult(job.ID, res); dbErr != nil {
+			log.Printf("[Worker %d] Failed to update DB for job %s: %v", id, job.ID, dbErr)
+		}
+
+		// Notify Synchronous Waiters
+		if ch, ok := jobManager.waitChans.Load(job.ID); ok {
+			// Cast interface{} back to chan
+			if resultChan, ok := ch.(chan JobResult); ok {
+				resultChan <- res
+				close(resultChan)
+			}
+			jobManager.waitChans.Delete(job.ID)
+		}
 		
-		jobManager.mu.Lock()
-		jobManager.results[job.ID] = res
-		jobManager.mu.Unlock()
+		// Cleanup
+		activeCancelFuncs.Delete(job.ID)
+		if job.Cancel != nil {
+			job.Cancel()
+		}
+		workerStates.Store(id, WorkerState{ID: id, Status: "idle"})
 	}
 }
 
@@ -410,25 +621,104 @@ type VerifyRequest struct {
 	Password string `json:"password"`
 }
 
+// verifyHandler handles synchronous verification by waiting for the background job
 func verifyHandler(w http.ResponseWriter, r *http.Request) {
 	var req VerifyRequest
-	json.NewDecoder(r.Body).Decode(&req)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	
+	// Parse Delimiters in Email field if user pasted "email:pass"
+	if req.Password == "" {
+		if strings.Contains(req.Email, "|") {
+			parts := strings.SplitN(req.Email, "|", 2)
+			req.Email = strings.TrimSpace(parts[0])
+			req.Password = strings.TrimSpace(parts[1])
+		} else if strings.Contains(req.Email, ":") {
+			parts := strings.SplitN(req.Email, ":", 2)
+			req.Email = strings.TrimSpace(parts[0])
+			req.Password = strings.TrimSpace(parts[1])
+		}
+	}
+	
 	id := uuid.NewString()
-	caps, headers, err := verifySMTP(req.Email, req.Password)
-	res := JobResult{
-		Status:       "success",
-		Capabilities: caps,
-		Headers:      headers,
-		CreatedAt:    time.Now(),
-		CompletedAt:  time.Now(),
+	log.Printf("[API] Sync Request received: %s (%s)", id, req.Email)
+
+	// 1. Insert Pending into DB
+	if err := createPendingScan(id, req.Email, req.Password); err != nil {
+		log.Printf("[API] Failed to insert pending scan: %v", err)
+		http.Error(w, "db error", 500)
+		return
 	}
-	if err != nil {
-		res.Status = "failed"
-		res.Error = err.Error()
+
+	// 2. Register Wait Channel
+	resultChan := make(chan JobResult, 1)
+	jobManager.waitChans.Store(id, resultChan)
+
+	// 3. Push to Queue
+	select {
+	case jobManager.queue <- VerifyJob{ID: id, Email: req.Email, Password: req.Password}:
+		log.Printf("[API] Job %s queued", id)
+	default:
+		log.Printf("[API] Queue full, rejecting job %s", id)
+		jobManager.waitChans.Delete(id)
+		updateScanResult(id, JobResult{Status: "failed", Error: "queue full", CompletedAt: time.Now()})
+		http.Error(w, "queue full", 503)
+		return
 	}
-	saveScan(id, req.Email, res.Status, res.Error, headers)
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+
+	// 4. Wait for Result or Timeout
+	select {
+	case res := <-resultChan:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(res)
+	case <-time.After(defaultTimeout):
+		log.Printf("[API] Timeout waiting for job %s", id)
+		// Clean up, but job might still be in queue/processing
+		jobManager.waitChans.Delete(id)
+		// We don't cancel the job essentially, just the client request
+		http.Error(w, "timeout", 504)
+	}
+}
+
+func verifyAsyncHandler(w http.ResponseWriter, r *http.Request) {
+	var req VerifyRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	
+	// Parse Delimiters in Email field if user pasted "email:pass"
+	if req.Password == "" {
+		if strings.Contains(req.Email, "|") {
+			parts := strings.SplitN(req.Email, "|", 2)
+			req.Email = strings.TrimSpace(parts[0])
+			req.Password = strings.TrimSpace(parts[1])
+		} else if strings.Contains(req.Email, ":") {
+			parts := strings.SplitN(req.Email, ":", 2)
+			req.Email = strings.TrimSpace(parts[0])
+			req.Password = strings.TrimSpace(parts[1])
+		}
+	}
+
+	id := uuid.NewString()
+	log.Printf("[API] Async Request received: %s (%s)", id, req.Email)
+
+	if err := createPendingScan(id, req.Email, req.Password); err != nil {
+		log.Printf("[API] Failed to insert pending scan: %v", err)
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	select {
+	case jobManager.queue <- VerifyJob{ID: id, Email: req.Email, Password: req.Password}:
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"job_id": id, "status": "pending"})
+	default:
+		updateScanResult(id, JobResult{Status: "failed", Error: "queue full", CompletedAt: time.Now()})
+		http.Error(w, "queue full", 503)
+	}
 }
 
 func verifyFileHandler(w http.ResponseWriter, r *http.Request) {
@@ -438,133 +728,230 @@ func verifyFileHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer file.Close()
+	
+	log.Printf("[API] File Upload received")
 	sc := bufio.NewScanner(file)
-	var results []JobResult
+	var jobIDs []string
+
 	for sc.Scan() {
-		p := strings.Split(sc.Text(), ":")
+		line := strings.TrimSpace(sc.Text())
+		if line == "" {
+			continue
+		}
+		
+		var p []string
+		if strings.Contains(line, "|") {
+			p = strings.SplitN(line, "|", 2)
+		} else {
+			p = strings.SplitN(line, ":", 2)
+		}
+		
 		if len(p) != 2 {
 			continue
 		}
 		id := uuid.NewString()
-		caps, headers, err := verifySMTP(p[0], p[1])
-		res := JobResult{
-			Status:       "success",
-			Capabilities: caps,
-			Headers:      headers,
-			CreatedAt:    time.Now(),
-			CompletedAt:  time.Now(),
-		}
-		if err != nil {
-			res.Status = "failed"
-			res.Error = err.Error()
-		}
-		saveScan(id, p[0], res.Status, res.Error, headers)
-		results = append(results, res)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(results)
-}
+		email := strings.TrimSpace(p[0])
+		password := strings.TrimSpace(p[1])
 
-func verifyAsyncHandler(w http.ResponseWriter, r *http.Request) {
-	var req VerifyRequest
-	json.NewDecoder(r.Body).Decode(&req)
-	id := uuid.NewString()
-	
-	// Store job as pending
-	jobManager.mu.Lock()
-	jobManager.results[id] = JobResult{
-		Status:    "pending",
-		CreatedAt: time.Now(),
-	}
-	jobManager.mu.Unlock()
-	
-	// Send to background queue
-	select {
-	case jobManager.queue <- VerifyJob{id, req.Email, req.Password}:
-	default:
-		jobManager.mu.Lock()
-		jobManager.results[id] = JobResult{
-			Status: "failed",
-			Error:  "job queue full",
+		if err := createPendingScan(id, email, password); err != nil {
+			log.Printf("[API] Failed to insert pending scan for %s: %v", email, err)
+			continue
 		}
-		jobManager.mu.Unlock()
+
+		select {
+		case jobManager.queue <- VerifyJob{ID: id, Email: email, Password: password}:
+			jobIDs = append(jobIDs, id)
+		default:
+			log.Printf("[API] Queue full during file upload for %s", email)
+		}
 	}
 	
+	log.Printf("[API] File Upload processed, queued %d jobs", len(jobIDs))
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"job_id": id})
+	json.NewEncoder(w).Encode(map[string]interface{}{"status": "queued", "job_ids": jobIDs, "count": len(jobIDs)})
 }
 
 func jobStatusHandler(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
-	jobManager.mu.RLock()
-	res, ok := jobManager.results[id]
-	jobManager.mu.RUnlock()
-	
-	if !ok {
+
+	// Check Active Loggers first (Realtime)
+	if val, ok := activeLoggers.Load(id); ok {
+		logger := val.(*SMTPLogger)
 		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"job not found"}`, http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"id":     id,
+			"status": "processing",
+			"logs":   logger.Dump(),
+		})
+		return
+	}
+
+	// Fallback to DB
+	var status, logsJSON string
+	err := db.QueryRow("SELECT status, COALESCE(logs,'[]') FROM scans WHERE id = ?", id).Scan(&status, &logsJSON)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			http.Error(w, `{"error":"job not found"}`, 404)
+		} else {
+			http.Error(w, "db error", 500)
+		}
 		return
 	}
 	
+	var logs []string
+	json.Unmarshal([]byte(logsJSON), &logs)
+
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(res)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"id":     id,
+		"status": status,
+		"logs":   logs,
+	})
 }
 
 /* ============================================================
-   API DOCS
+   WORKER APIs
 ============================================================ */
-type APIEndpoint struct {
-	Path        string   `json:"path"`
-	Method      string   `json:"method"`
-	Description string   `json:"description"`
-	Params      []string `json:"params,omitempty"`
-	Body        string   `json:"body,omitempty"`
+func stopAllJobs() {
+	log.Println("[Worker] Stopping ALL jobs...")
+	activeCancelFuncs.Range(func(key, value interface{}) bool {
+		cancel := value.(context.CancelFunc)
+		cancel()
+		activeCancelFuncs.Delete(key)
+		return true
+	})
 }
 
-var apiDocs = []APIEndpoint{
-	{Path: "/verify", Method: "POST", Description: "Verify a single email/password synchronously", Body: `{"email":"user@example.com","password":"secret"}`},
-	{Path: "/verify/file", Method: "POST", Description: "Upload a file with email:password lines for bulk verification", Body: "multipart/form-data file upload"},
-	{Path: "/verify/async", Method: "POST", Description: "Submit async verification job", Body: `{"email":"user@example.com","password":"secret"}`},
-	{Path: "/verify/status", Method: "GET", Description: "Check async job status", Params: []string{"id=job_id"}},
-}
-
-func docsHandler(w http.ResponseWriter, r *http.Request) {
+func getWorkersHandler(w http.ResponseWriter, r *http.Request) {
+	var states []WorkerState
+	workerStates.Range(func(key, value interface{}) bool {
+		states = append(states, value.(WorkerState))
+		return true
+	})
+	
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(apiDocs)
+	json.NewEncoder(w).Encode(states)
+}
+
+func stopWorkersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", 405)
+		return
+	}
+	
+	type StopReq struct {
+		All bool `json:"all"`
+		ID  int  `json:"id"` // Worker ID (optional, to stop current job of specific worker)
+	}
+	var req StopReq
+	json.NewDecoder(r.Body).Decode(&req)
+
+	if req.All {
+		stopAllJobs()
+		w.Write([]byte(`{"status":"all_stopped"}`))
+		return
+	}
+	
+	// Stop specific worker's job
+	if val, ok := workerStates.Load(req.ID); ok {
+		state := val.(WorkerState)
+		if state.Status == "processing" && state.JobID != "" {
+			if cancelVal, ok := activeCancelFuncs.Load(state.JobID); ok {
+				cancel := cancelVal.(context.CancelFunc)
+				cancel()
+				log.Printf("[Worker API] Stopped Worker %d (Job %s)", req.ID, state.JobID)
+				w.Write([]byte(`{"status":"stopped"}`))
+				return
+			}
+		}
+	}
+	
+	http.Error(w, "worker not active or job not found", 404)
 }
 
 /* ============================================================
-   SCAN HISTORY
+   API DOCS & HISTORY
 ============================================================ */
 type Scan struct {
-	ID        string    `json:"id"`
-	Email     string    `json:"email"`
-	Domain    string    `json:"domain"`
-	Status    string    `json:"status"`
-	Error     string    `json:"error,omitempty"`
-	CreatedAt time.Time `json:"created_at"`
+	ID         string    `json:"id"`
+	Email      string    `json:"email"`
+	Domain     string    `json:"domain"`
+	Status     string    `json:"status"`
+	Password   string    `json:"password,omitempty"` // Add Password
+	Error      string    `json:"error,omitempty"`
+	Headers    string    `json:"headers,omitempty"`
+	Logs       string    `json:"logs,omitempty"`     // Add Logs
+	AuthMethod string    `json:"auth_method,omitempty"`
+	CreatedAt  time.Time `json:"created_at"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+
+type PaginationMeta struct {
+	Total int `json:"total"`
+	Page  int `json:"page"`
+	Limit int `json:"limit"`
+}
+
+type ScansResponse struct {
+	Data       []Scan          `json:"data"`
+	Pagination PaginationMeta  `json:"pagination"`
 }
 
 func getScansHandler(w http.ResponseWriter, r *http.Request) {
-	fmt.Println("Handling /api/scans request") // Simple access logging
-
+	log.Printf("[API] Get History")
+	
+	// Parse Query Params
 	email := r.URL.Query().Get("email")
-	var query string
+	status := r.URL.Query().Get("status")
+	pageStr := r.URL.Query().Get("page")
+	limitStr := r.URL.Query().Get("limit")
+
+	page := 1
+	if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+		page = p
+	}
+	limit := 50
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
+		limit = l
+	}
+	offset := (page - 1) * limit
+
+	// Base Query
+	whereClause := "WHERE 1=1"
 	var args []interface{}
 
-	// Use COALESCE to handle potentially NULL columns to avoid Scan errors
-	query = `SELECT id, email, domain, status, COALESCE(error, ''), created_at FROM scans ORDER BY created_at DESC LIMIT 100`
 	if email != "" {
-		query = `SELECT id, email, domain, status, COALESCE(error, ''), created_at FROM scans WHERE email LIKE ? ORDER BY created_at DESC LIMIT 100`
-		args = []interface{}{"%" + email + "%"}
+		whereClause += " AND email LIKE ?"
+		args = append(args, "%"+email+"%")
 	}
+	if status != "" {
+		whereClause += " AND status = ?"
+		args = append(args, status)
+	}
+
+	// Count Total
+	var total int
+	countQuery := "SELECT COUNT(*) FROM scans " + whereClause
+	if err := db.QueryRow(countQuery, args...).Scan(&total); err != nil {
+		log.Printf("[DB] Count error: %v", err)
+		http.Error(w, "db error", 500)
+		return
+	}
+
+	// Fetch Data
+	query := fmt.Sprintf(`
+		SELECT id, email, domain, status, COALESCE(password, ''), COALESCE(error, ''), COALESCE(headers,'[]'), COALESCE(logs,'[]'), COALESCE(auth_method,''), created_at, completed_at 
+		FROM scans 
+		%s 
+		ORDER BY created_at DESC 
+		LIMIT ? OFFSET ?`, whereClause)
+	
+	args = append(args, limit, offset)
 
 	rows, err := db.Query(query, args...)
 	if err != nil {
-		fmt.Printf("Database query error: %v\n", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "database query failed"})
+		log.Printf("[DB] Query error: %v", err)
+		http.Error(w, "db error", 500)
 		return
 	}
 	defer rows.Close()
@@ -572,44 +959,70 @@ func getScansHandler(w http.ResponseWriter, r *http.Request) {
 	scans := make([]Scan, 0)
 	for rows.Next() {
 		var scan Scan
-		// We can scan directly now since we handled NULLs in SQL and types in DSN
-		if err := rows.Scan(&scan.ID, &scan.Email, &scan.Domain, &scan.Status, &scan.Error, &scan.CreatedAt); err != nil {
-			fmt.Printf("Row scan error: %v\n", err)
+		var headersJSON string
+		var logsJSON string
+		var completedAt sql.NullTime
+		
+		if err := rows.Scan(&scan.ID, &scan.Email, &scan.Domain, &scan.Status, &scan.Password, &scan.Error, &headersJSON, &logsJSON, &scan.AuthMethod, &scan.CreatedAt, &completedAt); err != nil {
+			log.Printf("[DB] Scan error: %v", err)
 			continue
 		}
+		if completedAt.Valid {
+			scan.CompletedAt = completedAt.Time
+		}
+		
+		scan.Headers = headersJSON
+		scan.Logs = logsJSON
+		
 		scans = append(scans, scan)
 	}
-	
-	if err := rows.Err(); err != nil {
-		fmt.Printf("Rows iteration error: %v\n", err)
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusInternalServerError)
-		json.NewEncoder(w).Encode(map[string]string{"error": "error reading results"})
-		return
+
+	resp := ScansResponse{
+		Data: scans,
+		Pagination: PaginationMeta{
+			Total: total,
+			Page:  page,
+			Limit: limit,
+		},
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(scans)
+	json.NewEncoder(w).Encode(resp)
 }
 
 func deleteScansHandler(w http.ResponseWriter, r *http.Request) {
+	log.Printf("[API] Clearing History")
+	stopAllJobs() // Stop all active jobs first
 	_, err := db.Exec(`DELETE FROM scans`)
 	if err != nil {
-		w.Header().Set("Content-Type", "application/json")
-		http.Error(w, `{"error":"delete failed"}`, http.StatusInternalServerError)
+		http.Error(w, "delete failed", 500)
 		return
 	}
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
 	json.NewEncoder(w).Encode(map[string]string{"status": "deleted"})
+}
+
+func docsHandler(w http.ResponseWriter, r *http.Request) {
+	apiDocs := []map[string]string{
+		{"path": "/verify", "method": "POST", "desc": "Sync verify"},
+		{"path": "/verify/async", "method": "POST", "desc": "Async verify"},
+		{"path": "/verify/file", "method": "POST", "desc": "Bulk file verify"},
+		{"path": "/verify/status", "method": "GET", "desc": "Check job status"},
+		{"path": "/api/scans", "method": "GET", "desc": "Get history"},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(apiDocs)
 }
 
 /* ============================================================
    MAIN
 ============================================================ */
 func main() {
+	// Setup standard logger to print microseconds for better debugging
+	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+
 	if err := initDB(); err != nil {
-		panic(err)
+		log.Fatalf("Failed to init DB: %v", err)
 	}
 
 	initRateLimiter()
@@ -623,6 +1036,8 @@ func main() {
 	r.Handle("/docs", http.HandlerFunc(docsHandler)).Methods("GET")
 	r.Handle("/api/scans", http.HandlerFunc(getScansHandler)).Methods("GET")
 	r.Handle("/api/scans", http.HandlerFunc(deleteScansHandler)).Methods("DELETE")
+	r.Handle("/api/workers", http.HandlerFunc(getWorkersHandler)).Methods("GET")
+	r.Handle("/api/workers/stop", http.HandlerFunc(stopWorkersHandler)).Methods("POST")
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.ServeFile(w, r, "index.html")
 	}).Methods("GET")
@@ -630,22 +1045,21 @@ func main() {
 	srv := &http.Server{Addr: serverAddr, Handler: r}
 
 	go func() {
-		fmt.Println("Server running on", serverAddr)
+		log.Printf("Server running on %s", serverAddr)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			panic(err)
+			log.Fatalf("Listen error: %v", err)
 		}
 	}()
 
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
-	fmt.Println("Shutting down server...")
-	close(jobManager.queue)
+	log.Println("Shutting down server...")
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := srv.Shutdown(ctx); err != nil {
-		fmt.Println("Server forced to shutdown:", err)
+		log.Printf("Server forced shutdown: %v", err)
 	}
-	fmt.Println("Server exited")
+	log.Println("Server exited")
 }
