@@ -924,7 +924,7 @@ func getScansHandler(w http.ResponseWriter, r *http.Request) {
 		page = p
 	}
 	limit := 50
-	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000 {
+	if l, err := strconv.Atoi(limitStr); err == nil && l > 0 && l <= 1000000 {
 		limit = l
 	}
 	offset := (page - 1) * limit
@@ -1022,9 +1022,165 @@ func docsHandler(w http.ResponseWriter, r *http.Request) {
 		{"path": "/verify/file", "method": "POST", "desc": "Bulk file verify"},
 		{"path": "/verify/status", "method": "GET", "desc": "Check job status"},
 		{"path": "/api/scans", "method": "GET", "desc": "Get history"},
+		{"path": "/api/export", "method": "GET", "desc": "Export scans"},
+		{"path": "/api/send-test", "method": "POST", "desc": "Send test email"},
 	}
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(apiDocs)
+}
+
+func exportScansHandler(w http.ResponseWriter, r *http.Request) {
+	format := r.URL.Query().Get("format") // csv, txt
+	status := r.URL.Query().Get("status") // all, success, failed
+	
+	whereClause := "WHERE 1=1"
+	var args []interface{}
+	
+	if status != "" {
+		whereClause += " AND status = ?"
+		args = append(args, status)
+	}
+	
+	query := fmt.Sprintf("SELECT email, password, domain, status FROM scans %s ORDER BY created_at DESC", whereClause)
+	rows, err := db.Query(query, args...)
+	if err != nil {
+		http.Error(w, "db error", 500)
+		return
+	}
+	defer rows.Close()
+	
+	if format == "txt" {
+		w.Header().Set("Content-Type", "text/plain")
+		w.Header().Set("Content-Disposition", "attachment; filename=verified_emails.txt")
+		for rows.Next() {
+			var email, password, domain, status string
+			rows.Scan(&email, &password, &domain, &status)
+			fmt.Fprintf(w, "%s:%s\n", email, password)
+		}
+		return
+	}
+	
+	// Default to CSV
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", "attachment; filename=verified_emails.csv")
+	fmt.Fprintln(w, "Email,Password,Domain,Status")
+	for rows.Next() {
+		var email, password, domain, status string
+		rows.Scan(&email, &password, &domain, &status)
+		fmt.Fprintf(w, "%s,%s,%s,%s\n", email, password, domain, status)
+	}
+}
+
+func sendTestEmailHandler(w http.ResponseWriter, r *http.Request) {
+	type SendTestReq struct {
+		Email    string `json:"email"`
+		Password string `json:"password"`
+		To       string `json:"to"`
+		Subject  string `json:"subject"`
+		Body     string `json:"body"`
+	}
+	var req SendTestReq
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json", 400)
+		return
+	}
+	
+	if req.Email == "" || req.Password == "" || req.To == "" {
+		http.Error(w, "missing required fields", 400)
+		return
+	}
+	
+	parts := strings.Split(req.Email, "@")
+	if len(parts) != 2 {
+		http.Error(w, "invalid email", 400)
+		return
+	}
+	
+	hosts, err := discoverSMTP(parts[1])
+	if err != nil {
+		http.Error(w, "discovery failed", 500)
+		return
+	}
+	
+	ports := []struct{
+		Port        string
+		ImplicitTLS bool
+	}{
+		{"465", true},
+		{"587", false},
+		{"25", false},
+	}
+	
+	var lastErr error
+	sent := false
+	
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	
+	logger := &SMTPLogger{}
+
+	for _, host := range hosts {
+		for _, p := range ports {
+			c, err := connectSMTP(ctx, host, p.Port, p.ImplicitTLS, logger)
+			if err != nil {
+				lastErr = err
+				continue
+			}
+			
+			caps := probeCapabilities(c, host)
+			if err := tryAuth(c, caps, req.Email, req.Password); err != nil {
+				c.Close()
+				lastErr = err
+				continue
+			}
+			
+			// Auth worked, now send
+			if err := c.Mail(req.Email); err != nil {
+				c.Close()
+				lastErr = err
+				continue
+			}
+			if err := c.Rcpt(req.To); err != nil {
+				c.Close()
+				lastErr = err
+				continue
+			}
+			
+			wc, err := c.Data()
+			if err != nil {
+				c.Close()
+				lastErr = err
+				continue
+			}
+			
+			msg := fmt.Sprintf("From: %s\r\nTo: %s\r\nSubject: %s\r\n\r\n%s", req.Email, req.To, req.Subject, req.Body)
+			_, err = wc.Write([]byte(msg))
+			if err != nil {
+				wc.Close()
+				c.Close()
+				lastErr = err
+				continue
+			}
+			err = wc.Close()
+			if err != nil {
+				c.Close()
+				lastErr = err
+				continue
+			}
+			
+			c.Quit()
+			sent = true
+			break
+		}
+		if sent { break }
+	}
+	
+	if sent {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"status": "sent"})
+	} else {
+		http.Error(w, fmt.Sprintf("failed to send: %v", lastErr), 500)
+	}
 }
 
 /* ============================================================
@@ -1050,6 +1206,8 @@ func main() {
 	r.Handle("/docs", http.HandlerFunc(docsHandler)).Methods("GET")
 	r.Handle("/api/scans", http.HandlerFunc(getScansHandler)).Methods("GET")
 	r.Handle("/api/scans", http.HandlerFunc(deleteScansHandler)).Methods("DELETE")
+	r.Handle("/api/export", http.HandlerFunc(exportScansHandler)).Methods("GET")
+	r.Handle("/api/send-test", http.HandlerFunc(sendTestEmailHandler)).Methods("POST")
 	r.Handle("/api/workers", http.HandlerFunc(getWorkersHandler)).Methods("GET")
 	r.Handle("/api/workers/stop", http.HandlerFunc(stopWorkersHandler)).Methods("POST")
 	r.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
